@@ -1,0 +1,26 @@
+{
+  "synthesis_id": "S-001",
+  "title": "Combine the parser and renderer proposals",
+  "problem_statement": "The group needs one compatible interface that preserves normalization and output formatting.",
+  "source_change_ids": [
+    "C-973e33c",
+    "C-e2a6496"
+  ],
+  "proposed_approach": "Keep the parser's normalized input contract and compose it with the renderer through a small explicit pipeline.",
+  "alternatives_considered": [
+    "Keep both implementations isolated",
+    "Replace both with a new shared implementation"
+  ],
+  "tradeoffs": [
+    "Composition preserves independent contributions but introduces one integration boundary."
+  ],
+  "validation_plan": [
+    "Test whitespace normalization",
+    "Test rendered output",
+    "Test the parser-to-renderer pipeline"
+  ],
+  "decision": "draft",
+  "unresolved_concerns": [
+    "Confirm the public function name with the group before integration."
+  ]
+}
