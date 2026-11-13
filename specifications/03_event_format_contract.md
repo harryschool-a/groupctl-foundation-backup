@@ -26,8 +26,9 @@ Every event contains:
   "event_type": "change_published",
   "group_id": "G-12",
   "person_id": "P17",
-  "created_at": "2026-10-16T02:15:30Z",
-  "related_events": []
+  "created_at": "2026-10-16T02:15:30.123456Z",
+  "related_events": [],
+  "agent_id": "coder-alpha"
 }
 ```
 
@@ -43,6 +44,8 @@ created_at
 related_events
 ```
 
+`agent_id` is an optional v1.1 attribution field. `person_id` remains the responsible group member; `agent_id` distinguishes an AI agent operated by that member. It is not cryptographic authentication. New events are written with microsecond timestamp precision to preserve task and session ordering when multiple records are created in the same second. Readers continue to accept older timezone-aware timestamps without fractional seconds.
+
 ## 3. Supported Event Types
 
 ```text
@@ -57,6 +60,9 @@ blocker
 synthesis_candidate
 final_candidate
 final_result
+task_assigned
+agent_session
+code_proposal
 ```
 
 ## 4. `change_published`

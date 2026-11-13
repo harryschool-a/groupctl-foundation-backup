@@ -272,15 +272,8 @@ def demo(auto_confirm_final: bool) -> None:
         run_git(c, "fetch", "origin", "--prune")
         run_git(c, "switch", "main")
         run_git(c, "merge", "--ff-only", "origin/people/P22/renderer")
-        run_tests(c)
+        passed_count, _failed_count, _test_command = run_tests(c)
         tested_commit = run_git(c, "rev-parse", "HEAD").stdout.strip()
-        test_output = subprocess.run(
-            [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
-            cwd=c, text=True, encoding="utf-8", errors="replace",
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True,
-        ).stdout
-        count_match = re.search(r"Ran (\d+) tests? in", test_output)
-        passed_count = int(count_match.group(1)) if count_match else 0
         test_event_path, _ = publish_event(c, "test_result", {
             "scope": "canonical main",
             "commit": tested_commit,

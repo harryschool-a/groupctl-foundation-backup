@@ -196,6 +196,14 @@ class EventCreationTests(unittest.TestCase):
                 self.root, "finding", {"summary": "A finding", "evidence": []}, None, []
             )
 
+    def test_created_at_keeps_subsecond_precision_for_event_ordering(self):
+        event_path = groupctl.create_event(self.root, "finding", {
+            "summary": "Timestamp precision check.",
+            "evidence": ["Event timestamps retain microseconds."],
+        }, "P17", [])
+        event = groupctl.read_json(event_path)
+        self.assertRegex(event["created_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
+
     def test_write_json_refuses_overwrite(self):
         path = self.root / ".group/events/test.json"
         groupctl.write_json(path, {"first": True})
@@ -510,7 +518,7 @@ class AgentBridgeTests(unittest.TestCase):
 
     def test_context_contains_assignment_identity_and_safety_rules(self):
         context = groupctl.build_agent_context(self.root, "P17")
-        self.assertEqual(context["tool_version"], "1.0.0")
+        self.assertEqual(context["tool_version"], "1.1.0")
         self.assertEqual(context["group"]["group_id"], "G-12")
         self.assertEqual(context["member"]["person_id"], "P17")
         self.assertIn("# Group Assignment", context["assignment"]["text"])

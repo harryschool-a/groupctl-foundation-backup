@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 PROTOCOL_VERSION = "0.1"
 GROUP_DIR = Path(".group")
 CONFIG_PATH = GROUP_DIR / "group.json"
@@ -49,6 +49,7 @@ SUPPORTED_EVENT_TYPES = {
     "final_result",
     "task_assigned",
     "agent_session",
+    "code_proposal",
 }
 
 # AI agents may submit collaboration evidence and proposals, but may not use the
@@ -64,6 +65,7 @@ AGENT_SUBMITTABLE_EVENT_TYPES = {
     "blocker",
     "synthesis_candidate",
     "agent_session",
+    "code_proposal",
 }
 
 COMMON_EVENT_FIELDS = {
@@ -74,6 +76,7 @@ COMMON_EVENT_FIELDS = {
     "person_id",
     "created_at",
     "related_events",
+    "agent_id",
 }
 
 REVIEW_VERDICTS = {"accept", "accept_with_changes", "reject", "needs_more_evidence"}
@@ -275,6 +278,28 @@ def validate_event_payload(data: dict[str, Any]) -> list[str]:
             errors.append("agent_session status must be one of: started, completed, failed.")
         errors.extend(_validate_string_list_field(data, "actions", required=False))
 
+    elif event_type == "code_proposal":
+        errors.extend(_validate_required_string_fields(
+            data, ("proposal_id", "task_id", "summary", "base_commit", "patch_file", "patch_sha256", "risk_level")
+        ))
+        for field in ("files_changed", "test_plan"):
+            errors.extend(_validate_string_list_field(data, field))
+        if data.get("risk_level") not in {"low", "medium", "high"}:
+            errors.append("risk_level must be one of: low, medium, high.")
+        patch_file = data.get("patch_file")
+        if _is_nonempty_string(patch_file):
+            patch_path = Path(patch_file)
+            if patch_path.is_absolute() or ".." in patch_path.parts or not patch_file.replace("\\", "/").startswith(".group/proposals/"):
+                errors.append("patch_file must be a repository-relative path under .group/proposals/ without '..'.")
+        digest = data.get("patch_sha256")
+        if _is_nonempty_string(digest) and (len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest.lower())):
+            errors.append("patch_sha256 must be a 64-character hexadecimal SHA-256 digest.")
+
+    # Agent identity is attribution metadata, never authentication. Validate its shape
+    # whenever it appears in the common event envelope.
+    if "agent_id" in data and (not _is_nonempty_string(data.get("agent_id")) or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for ch in data.get("agent_id", ""))):
+        errors.append("agent_id must be a non-empty path-safe identifier.")
+
     return errors
 
 
@@ -314,7 +339,7 @@ def validate_event(data: Any, expected_path: Path | None = None) -> list[str]:
     if not isinstance(data, dict):
         return ["Event must contain a JSON object."]
 
-    for field in sorted(COMMON_EVENT_FIELDS):
+    for field in sorted(COMMON_EVENT_FIELDS - {"agent_id"}):
         if field not in data:
             errors.append(f"Missing required field: {field}")
 
@@ -569,7 +594,7 @@ def _resolve_person_id(root: Path, requested_person_id: str | None) -> str:
 
 
 def create_event(root: Path, event_type: str, payload: Any, person_id: str | None,
-                 related_events: list[str]) -> Path:
+                 related_events: list[str], *, agent_id: str | None = None) -> Path:
     """Create a local event file from a payload, adding the common envelope."""
     root = root.resolve()
     config = _load_valid_group(root)
@@ -601,14 +626,20 @@ def create_event(root: Path, event_type: str, payload: Any, person_id: str | Non
         if not event_path.exists():
             break
 
+    if agent_id is not None and (
+        not _is_nonempty_string(agent_id)
+        or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for ch in agent_id)
+    ):
+        raise ValueError("agent_id must be a non-empty path-safe identifier.")
     event: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "event_id": event_id,
         "event_type": event_type,
         "group_id": config["group_id"],
         "person_id": chosen_person_id,
-        "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_at": now.isoformat(timespec="microseconds").replace("+00:00", "Z"),
         "related_events": related_events,
+        **({"agent_id": agent_id} if agent_id else {}),
         **payload,
     }
     errors = validate_event(event, event_path)
@@ -623,9 +654,9 @@ def create_event(root: Path, event_type: str, payload: Any, person_id: str | Non
 def _agent_event_summary(event: dict[str, Any]) -> dict[str, Any]:
     """Return a compact, predictable event representation for an external agent."""
     fields = (
-        "event_id", "event_type", "group_id", "person_id", "created_at",
+        "event_id", "event_type", "group_id", "person_id", "agent_id", "created_at",
         "change_id", "summary", "branch", "commit", "verdict", "result",
-        "decision", "synthesis_id", "title", "source_change_ids", "scope",
+        "decision", "synthesis_id", "title", "source_change_ids", "scope", "task_id", "proposal_id",
     )
     return {key: event[key] for key in fields if key in event}
 
@@ -800,6 +831,7 @@ def submit_agent_event(
     submission: Any,
     *,
     remote: str | None = None,
+    agent_id: str | None = None,
 ) -> Path:
     """Validate an agent response and record it as one immutable collaboration event."""
     root = root.resolve()
@@ -850,8 +882,10 @@ def submit_agent_event(
         source = next((event for event in events if event.get("event_type") == "change_published" and event.get("change_id") == change_id), None)
         if source is None:
             raise ValueError(f"Cannot review unknown change_id {change_id!r}.")
-        if source.get("person_id") == person_id:
-            raise ValueError("Self-review is not allowed by the agent bridge; use a different member for independent review.")
+        same_human = source.get("person_id") == person_id
+        same_agent = bool(agent_id and source.get("agent_id") == agent_id)
+        if same_human and (not agent_id or not source.get("agent_id") or same_agent):
+            raise ValueError("Self-review is not allowed: use a different member or a distinct registered agent identity.")
         if source["event_id"] not in related_events:
             related_events = [*related_events, source["event_id"]]
 
@@ -885,6 +919,27 @@ def submit_agent_event(
             if ancestry.returncode != 0:
                 raise ValueError("Successful integration cannot be recorded: merge_commit is not an ancestor of target_branch.")
 
+    elif event_type == "code_proposal":
+        proposal_id = payload.get("proposal_id")
+        base_commit = payload.get("base_commit")
+        if not _git_commit_exists(root, base_commit):
+            raise ValueError("code_proposal base_commit must resolve to a commit in this repository.")
+        patch_file = payload.get("patch_file")
+        patch_path = (root / patch_file).resolve() if _is_nonempty_string(patch_file) else None
+        proposals_root = (root / GROUP_DIR / "proposals").resolve()
+        if patch_path is None or proposals_root not in patch_path.parents:
+            raise ValueError("code_proposal patch_file must be inside .group/proposals/.")
+        if not patch_path.is_file():
+            raise ValueError("code_proposal patch file does not exist.")
+        patch_bytes = patch_path.read_bytes()
+        digest = hashlib.sha256(patch_bytes).hexdigest()
+        if digest != payload.get("patch_sha256"):
+            raise ValueError("code_proposal patch_sha256 does not match the stored patch file.")
+        if not patch_bytes.strip().startswith(b"diff --git "):
+            raise ValueError("code_proposal patch must be a Git unified diff beginning with 'diff --git'.")
+        if not _git_commit_exists(root, base_commit):
+            raise ValueError("code_proposal base commit is unavailable.")
+
     elif event_type == "synthesis_candidate":
         source_ids = payload.get("source_change_ids")
         if isinstance(source_ids, list):
@@ -900,7 +955,7 @@ def submit_agent_event(
     if unknown_related:
         raise ValueError("related_events contains unknown event IDs: " + ", ".join(unknown_related))
 
-    return create_event(root, event_type, payload, person_id, related_events)
+    return create_event(root, event_type, payload, person_id, related_events, agent_id=agent_id)
 
 
 def _run_git(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -1498,7 +1553,7 @@ def command_agent_submit(args: argparse.Namespace) -> int:
         input_path = root / input_path
     try:
         submission = read_json(input_path)
-        event_path = submit_agent_event(root, args.person_id, submission, remote=args.remote)
+        event_path = submit_agent_event(root, args.person_id, submission, remote=args.remote, agent_id=getattr(args, "agent_id", None))
         event = read_json(event_path)
     except (ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -1913,8 +1968,16 @@ def command_audit(args: argparse.Namespace) -> int:
     for e in events:
         if e.get('event_type')=='review': reviews.setdefault(e.get('change_id'),[]).append(e)
     for cid,e in changes.items():
-        independent=[r for r in reviews.get(cid,[]) if r.get('person_id')!=e.get('person_id')]
-        if not independent: issues.append(f"Change {cid} has no independent review.")
+        independent=[]
+        for review_event in reviews.get(cid, []):
+            different_member = review_event.get("person_id") != e.get("person_id")
+            different_agent = bool(
+                review_event.get("agent_id") and e.get("agent_id")
+                and review_event.get("agent_id") != e.get("agent_id")
+            )
+            if different_member or different_agent:
+                independent.append(review_event)
+        if not independent: issues.append(f"Change {cid} has no independent member or distinct-agent review.")
     active=[e for e in events if e.get('event_type')=='blocker' and str(e.get('status','open')).lower() not in {'resolved','closed'}]
     if active: issues.append(f"{len(active)} blocker event(s) are recorded.")
     print("AUDIT"); print(f"Group: {config['group_id']}"); print(f"Events checked: {len(events)}")
@@ -1922,10 +1985,30 @@ def command_audit(args: argparse.Namespace) -> int:
         print("Result: ATTENTION REQUIRED"); [print("- "+i) for i in issues]; return 2
     print("Result: OK — no protocol-level issues found."); return 0
 
+def command_live_agent_run(args: argparse.Namespace) -> int:
+    from live_agents import command_agent_run
+    return command_agent_run(args)
+
+
+def command_live_agents_run(args: argparse.Namespace) -> int:
+    from live_agents import command_agents_run
+    return command_agents_run(args)
+
+
+def command_agent_apply(args: argparse.Namespace) -> int:
+    from live_agents import command_agent_apply
+    return command_agent_apply(args)
+
+
+def command_agent_publish(args: argparse.Namespace) -> int:
+    from live_agents import command_agent_publish
+    return command_agent_publish(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="groupctl",
-        description="Version 1.0 group collaboration and provider-neutral AI-agent bridge.",
+        description="Version 1.1 group collaboration and live provider-backed AI-agent runtime.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1999,7 +2082,47 @@ def build_parser() -> argparse.ArgumentParser:
     agent_submit_parser.add_argument("--person-id", required=True, help="member identity submitting the response")
     agent_submit_parser.add_argument("--input-file", required=True, help="JSON file with event_type, payload, and optional related_events")
     agent_submit_parser.add_argument("--remote", help="include validated events from an already-fetched remote, e.g. origin")
+    agent_submit_parser.add_argument("--agent-id", help="distinct AI-agent identity for attribution and independent review")
     agent_submit_parser.set_defaults(func=command_agent_submit)
+
+    # Live model-backed agents use an OpenAI-compatible chat-completions endpoint.
+    # Local Ollama is supported without an API key; hosted providers can use an env var.
+    agent_run_parser = subparsers.add_parser("agent-run", help="run one live AI agent against an assigned task")
+    agent_run_parser.add_argument("--root", default=".")
+    agent_run_parser.add_argument("--person-id", required=True)
+    agent_run_parser.add_argument("--agent-id", required=True)
+    agent_run_parser.add_argument("--task-id", required=True)
+    agent_run_parser.add_argument("--role", choices=["implementer", "reviewer", "analyst"], default="implementer")
+    agent_run_parser.add_argument("--change-id", help="required for reviewer role")
+    agent_run_parser.add_argument("--base-url", default="http://localhost:11434/v1")
+    agent_run_parser.add_argument("--model", required=True)
+    agent_run_parser.add_argument("--api-key-env", default="", help="environment variable holding provider key; omit for local Ollama")
+    agent_run_parser.add_argument("--timeout", type=int, default=180)
+    agent_run_parser.add_argument("--max-tokens", type=int, default=5000)
+    agent_run_parser.set_defaults(func=command_live_agent_run)
+
+    agents_run_parser = subparsers.add_parser("agents-run", help="run configured live agents concurrently")
+    agents_run_parser.add_argument("--root", default=".")
+    agents_run_parser.add_argument("--config-file", default=".group/agents.json")
+    agents_run_parser.add_argument("--max-workers", type=int, default=4)
+    agents_run_parser.set_defaults(func=command_live_agents_run)
+
+    agent_apply_parser = subparsers.add_parser("agent-apply", help="apply a code proposal after explicit human approval")
+    agent_apply_parser.add_argument("--root", default=".")
+    agent_apply_parser.add_argument("--proposal-id", required=True)
+    agent_apply_parser.add_argument("--person-id", required=True)
+    agent_apply_parser.add_argument("--expected-head", required=True)
+    agent_apply_parser.add_argument("--human-approved", action="store_true")
+    agent_apply_parser.set_defaults(func=command_agent_apply)
+
+    agent_publish_parser = subparsers.add_parser("agent-publish", help="publish a committed agent contribution as a change event")
+    agent_publish_parser.add_argument("--root", default=".")
+    agent_publish_parser.add_argument("--person-id", required=True)
+    agent_publish_parser.add_argument("--agent-id", required=True)
+    agent_publish_parser.add_argument("--summary", required=True)
+    agent_publish_parser.add_argument("--test-run", action="append", default=[])
+    agent_publish_parser.add_argument("--known-issue", action="append", default=[])
+    agent_publish_parser.set_defaults(func=command_agent_publish)
 
     task_create_parser = subparsers.add_parser("task-create", help="assign or update a structured task")
     task_create_parser.add_argument("--root", default=".")

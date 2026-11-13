@@ -134,3 +134,13 @@ A clean `git pull` by itself is not a complete SYNC.
 9. Validate, then commit/push `.group/final/final_report.md`, `.group/final/final.json`, and the `final_result` event. Report the exact canonical code commit and report path.
 
 `FINAL` is group finalization, not submission of the initiator's personal branch. The final code commit is intentionally distinct from later commits that publish finalization records.
+
+
+## Live AI agents (v1.1)
+
+- Use `python groupctl.py agent-run` for one task-bound model agent or `python groupctl.py agents-run` for concurrent configured agents.
+- Agent IDs must be unique; `person_id` remains the responsible human group member.
+- Implementer agents return a patch proposal only. Do not apply generated code without human inspection and `agent-apply --human-approved` on a personal branch.
+- After a human inspects, tests, and commits the proposal, use `agent-publish` to record the contribution with its producing `agent_id`.
+- Use a different agent identity for AI review. Record clearly that distinct-agent review is not the same as independent human review.
+- Never place API keys in `.group/agents.json`; use environment variables.

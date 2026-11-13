@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "agents": [
+    {
+      "agent_id": "coder-alpha",
+      "person_id": "P17",
+      "task_id": "T-IMPLEMENT-A",
+      "role": "implementer",
+      "provider": "openai-compatible",
+      "base_url": "http://localhost:11434/v1",
+      "model": "REPLACE_WITH_YOUR_INSTALLED_MODEL",
+      "api_key_env": "",
+      "timeout": 240,
+      "max_tokens": 6000
+    },
+    {
+      "agent_id": "coder-beta",
+      "person_id": "P17",
+      "task_id": "T-IMPLEMENT-B",
+      "role": "implementer",
+      "provider": "openai-compatible",
+      "base_url": "http://localhost:11434/v1",
+      "model": "REPLACE_WITH_YOUR_INSTALLED_MODEL",
+      "api_key_env": "",
+      "timeout": 240,
+      "max_tokens": 6000
+    }
+  ]
+}
