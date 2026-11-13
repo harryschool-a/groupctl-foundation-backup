@@ -1,0 +1,15 @@
+{
+  "protocol_version": "0.1",
+  "event_id": "E-20261113T081437Z-P17-2030",
+  "event_type": "finding",
+  "group_id": "G-12",
+  "person_id": "P17",
+  "created_at": "2026-11-13T08:14:37Z",
+  "related_events": [],
+  "summary": "Mock agent inspected the current assignment and collaboration context.",
+  "evidence": [
+    "The supplied context identifies group G-12.",
+    "The assignment is available at .group/assignment/assignment.md.",
+    "The context contains 10 validated collaboration event(s)."
+  ]
+}

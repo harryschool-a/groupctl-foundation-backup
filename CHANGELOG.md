@@ -1,21 +1,17 @@
 # Changelog
 
-## Version 0.2
+## 1.0.0
 
-- Added a `status` CLI command that summarizes published changes, latest reviews and integrations, test evidence, synthesis candidates, blockers, and finalization state.
-- Added optional `status --remote <name>` support for validated events on already-fetched remote-tracking branches. The command does not fetch, merge, or mark events seen.
-- Added Git ancestry checks so a source commit can be recognized as present on the configured canonical branch even when the integration event originally targeted a contributor branch.
-- Added `synthesis_candidate` events to record source change IDs, the problem, proposed approach, alternatives, tradeoffs, validation plan, decision, and unresolved concerns.
-- Added the `SYNTHESIZE` AI-agent procedure and a sample synthesis payload.
-- Updated the three-member demo to publish a draft synthesis candidate and display group status.
-- Made local/remote event comparison robust to Windows `core.autocrlf` checkout normalization by preferring the committed Git blob.
-- Expanded unit tests to 31 passing tests and retained the end-to-end three-clone demonstration.
+### Added
+- Structured task records and task listing.
+- Safe `sync` command for fetch + remote collaboration discovery.
+- Local HTML dashboard generated from validated collaboration records.
+- Collaboration audit for missing independent reviews and recorded blockers.
 
-## Version 0.1
+### Retained from v0.3
+- Provider-neutral AI Agent Bridge.
+- Mock agent workflow without paid APIs.
+- Remote event validation, status, review, synthesis, test evidence, and human-confirmed finalization.
 
-- Initial group configuration and member descriptors.
-- Structured immutable collaboration events.
-- Local event creation, validation, and listing.
-- Read-only remote event discovery and local inspected-event checkpoints.
-- Final candidate generation and explicit-confirmation finalization.
-- Initial three-member local Git collaboration demo.
+### Compatibility
+- The collaboration protocol remains `0.1` so existing v0.x event and member records remain readable.

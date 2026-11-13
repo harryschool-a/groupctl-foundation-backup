@@ -1,8 +1,8 @@
-# Windows Quick Start — groupctl v0.2
+# Windows Quick Start — groupctl v1.0
 
 ## 1. Extract safely
 
-Extract this ZIP into a **new folder** (for example, `Downloads\groupctl_foundation_v0.2`). Do not extract it over an existing working repository. The archive is a tested package snapshot, not a patch that knows how to merge your local uncommitted work.
+Extract this ZIP into a **new folder** (for example, `Downloads\groupctl_foundation_v0.3`). Do not extract it over an existing working repository. The archive is a tested package snapshot, not a patch that knows how to merge your local uncommitted work.
 
 This ZIP does not include `.git` history, remote configuration, or credentials. To contribute to your existing GitHub project, use the separate **upgrade patch** on a new branch based on your current collaboration branch; do not try to push directly from this extracted snapshot.
 
@@ -78,6 +78,25 @@ Open `AGENT_INSTRUCTIONS.md` in the context of the coding assistant you use with
 
 A synthesis candidate is not a code merge. It records source changes, proposed approach, alternatives, tradeoffs, validation plan, decision, and unresolved concerns. The resulting implementation must still be separately published, reviewed, tested, and integrated.
 
-## 7. Important limitations
+## 7. Try the AI-agent bridge without an API
+
+Export project context for your configured member:
+
+```powershell
+python groupctl.py agent-context --person-id P17 --output .group/local/agent_context.json
+```
+
+Try the deterministic mock agent. The first run only writes context and a proposed submission; the `--submit` form creates a local finding event:
+
+```powershell
+python scripts/mock_agent.py --person-id P17
+python scripts/mock_agent.py --person-id P17 --submit
+python groupctl.py validate
+python groupctl.py status
+```
+
+An external AI tool can use the same JSON context/submission format. Read `specifications/08_ai_agent_bridge.md` for the contract. The bridge does not call an LLM or automatically commit/push its output.
+
+## 8. Important limitations
 
 This release provides a local CLI, shared Git event protocol, portable AI-agent instructions, finalization checks, and a simulated multi-member workflow. It does **not** provide an autonomous AI-agent runner, centralized server, secure identity/authorization system, task scheduler, or automatic semantic judge. Real participants still need access to the same Git repository and must inspect diffs and evidence.

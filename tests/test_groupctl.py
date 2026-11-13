@@ -466,6 +466,201 @@ class RemoteEventTests(unittest.TestCase):
 
 
 
+class AgentBridgeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        groupctl.initialize_repository(
+            self.root, "G-12", "P17", "Student A", "main",
+            ".group/assignment/assignment.md",
+        )
+        (self.root / "AGENT_INSTRUCTIONS.md").write_text("# Agent rules\nDo not merge without approval.\n", encoding="utf-8")
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def add_member(self, person_id="P18", display_name="Student B"):
+        member = {
+            "protocol_version": groupctl.PROTOCOL_VERSION,
+            "person_id": person_id,
+            "display_name": display_name,
+            "joined_at": "2026-11-13T00:00:00Z",
+        }
+        path = self.root / ".group" / "members" / f"{person_id}.json"
+        path.write_text(json.dumps(member), encoding="utf-8")
+
+    def create_change_event(self, *, person_id="P17", change_id="C-source"):
+        return groupctl.create_event(
+            self.root,
+            "change_published",
+            {
+                "change_id": change_id,
+                "branch": "people/P17/source",
+                "commit": "abc123",
+                "summary": "A source contribution",
+                "files_changed": ["src/example.py"],
+                "interface_changes": [],
+                "tests_run": [],
+                "known_issues": [],
+                "proposed_for_integration": True,
+            },
+            person_id,
+            [],
+        )
+
+    def test_context_contains_assignment_identity_and_safety_rules(self):
+        context = groupctl.build_agent_context(self.root, "P17")
+        self.assertEqual(context["tool_version"], "1.0.0")
+        self.assertEqual(context["group"]["group_id"], "G-12")
+        self.assertEqual(context["member"]["person_id"], "P17")
+        self.assertIn("# Group Assignment", context["assignment"]["text"])
+        self.assertIn("# Agent rules", context["agent_instructions"])
+        self.assertTrue(any("human" in rule.lower() for rule in context["safety_rules"]))
+        self.assertFalse(context["repository"]["available"])
+
+    def test_context_can_omit_instructions(self):
+        context = groupctl.build_agent_context(self.root, "P17", include_instructions=False)
+        self.assertIsNone(context["agent_instructions"])
+
+    def test_context_rejects_invalid_event_state(self):
+        bad_path = self.root / ".group" / "events" / "broken.json"
+        bad_path.write_text("{not json", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "invalid collaboration events"):
+            groupctl.build_agent_context(self.root, "P17")
+
+    def test_agent_can_submit_valid_finding(self):
+        path = groupctl.submit_agent_event(
+            self.root,
+            "P17",
+            {"event_type": "finding", "payload": {"summary": "A useful finding", "evidence": ["Observed locally"]}},
+        )
+        event = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(event["event_type"], "finding")
+        self.assertEqual(event["person_id"], "P17")
+        self.assertEqual(groupctl.validate_event(event, path), [])
+
+    def test_agent_cannot_submit_finalization_event(self):
+        with self.assertRaisesRegex(ValueError, "does not permit"):
+            groupctl.submit_agent_event(
+                self.root, "P17",
+                {"event_type": "final_result", "payload": {}},
+            )
+
+    def test_agent_cannot_override_common_envelope(self):
+        with self.assertRaisesRegex(ValueError, "common envelope fields"):
+            groupctl.submit_agent_event(
+                self.root, "P17",
+                {"event_type": "finding", "payload": {
+                    "protocol_version": "9.9", "summary": "Bad", "evidence": []
+                }},
+            )
+
+    def test_agent_bridge_rejects_self_review(self):
+        self.create_change_event()
+        with self.assertRaisesRegex(ValueError, "Self-review is not allowed"):
+            groupctl.submit_agent_event(
+                self.root, "P17",
+                {"event_type": "review", "payload": {
+                    "change_id": "C-source", "verdict": "accept", "summary": "Looks good",
+                    "issues": [], "tests_run": [],
+                }},
+            )
+
+    def test_agent_bridge_allows_independent_review_and_links_source_event(self):
+        self.create_change_event()
+        self.add_member()
+        path = groupctl.submit_agent_event(
+            self.root, "P18",
+            {"event_type": "review", "payload": {
+                "change_id": "C-source", "verdict": "accept_with_changes", "summary": "Needs one clarification",
+                "issues": ["Document the return type"], "tests_run": [],
+            }},
+        )
+        event = json.loads(path.read_text(encoding="utf-8"))
+        source = next(
+            p for p in (self.root / ".group/events").glob("*.json")
+            if json.loads(p.read_text(encoding="utf-8")).get("event_type") == "change_published"
+            and json.loads(p.read_text(encoding="utf-8")).get("change_id") == "C-source"
+        )
+        source_event_id = json.loads(source.read_text(encoding="utf-8"))["event_id"]
+        self.assertIn(source_event_id, event["related_events"])
+
+    def init_git_repository(self):
+        subprocess.run(["git", "init", "-b", "main", str(self.root)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Agent Bridge Test"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "agent-bridge@example.invalid"], check=True)
+        (self.root / "tracked.txt").write_text("bridge test\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-m", "test fixture"], check=True, stdout=subprocess.PIPE)
+        return subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], check=True,
+            text=True, stdout=subprocess.PIPE,
+        ).stdout.strip()
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required for agent Git-evidence tests")
+    def test_agent_change_published_requires_existing_commit_and_branch(self):
+        commit = self.init_git_repository()
+        path = groupctl.submit_agent_event(
+            self.root, "P17",
+            {"event_type": "change_published", "payload": {
+                "change_id": "C-git", "branch": "main", "commit": commit,
+                "summary": "Publish bridge implementation", "files_changed": ["tracked.txt"],
+                "interface_changes": [], "tests_run": [], "known_issues": [],
+                "proposed_for_integration": True,
+            }},
+        )
+        event = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(event["commit"], commit)
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required for agent Git-evidence tests")
+    def test_agent_test_result_requires_existing_commit(self):
+        commit = self.init_git_repository()
+        path = groupctl.submit_agent_event(
+            self.root, "P17",
+            {"event_type": "test_result", "payload": {
+                "scope": "main", "commit": commit, "commands": ["python -m unittest"],
+                "automated_result": "pass", "passed": 1, "failed": 0, "skipped": 0,
+                "human_checks_required": [], "summary": "One test passed on the recorded commit.",
+            }},
+        )
+        event = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(event["commit"], commit)
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required for agent Git-evidence tests")
+    def test_agent_successful_integration_must_be_on_target_branch(self):
+        commit = self.init_git_repository()
+        self.create_change_event()
+        integration_path = groupctl.submit_agent_event(
+            self.root, "P17",
+            {"event_type": "integration_result", "payload": {
+                "change_id": "C-source", "target_branch": "main", "result": "success",
+                "merge_commit": commit, "conflicts": [], "verification": {"tests": "pass"},
+                "summary": "Verified on main.",
+            }},
+        )
+        integration = json.loads(integration_path.read_text(encoding="utf-8"))
+        self.assertEqual(integration["merge_commit"], commit)
+
+    def test_agent_synthesis_requires_known_source_changes(self):
+        payload = {
+            "synthesis_id": "S-1", "title": "Combine", "problem_statement": "Need one approach",
+            "source_change_ids": ["C-missing"], "proposed_approach": "Combine ideas",
+            "alternatives_considered": [], "tradeoffs": [], "validation_plan": [],
+            "decision": "draft", "unresolved_concerns": [],
+        }
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            groupctl.submit_agent_event(self.root, "P17", {"event_type": "synthesis_candidate", "payload": payload})
+
+    def test_agent_context_cli_outputs_parseable_json(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = groupctl.main(["agent-context", "--root", str(self.root), "--person-id", "P17", "--no-instructions"])
+        self.assertEqual(code, 0)
+        decoded = json.loads(output.getvalue())
+        self.assertEqual(decoded["member"]["person_id"], "P17")
+
+
+
 @unittest.skipUnless(shutil.which("git"), "Git is required for finalization integration tests")
 class FinalizationTests(unittest.TestCase):
     def setUp(self):

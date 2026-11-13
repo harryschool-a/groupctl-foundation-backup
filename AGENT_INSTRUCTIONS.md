@@ -1,8 +1,8 @@
-# Local AI Agent Collaboration Instructions — Version 0.2
+# Local AI Agent Collaboration Instructions — Version 1.0
 
 These are **human-to-agent prompt commands**, not required shell subcommands. When the human types `SYNC`, `PUB`, `INT C-17`, `REV C-17`, `TEST`, `STATUS`, `SYNTHESIZE <topic>`, or `FINAL`, follow the procedure below. Use Git and `groupctl` for repeatable mechanics; use reasoning for semantic compatibility and conflict decisions. Ask the human when the intended behavior is materially uncertain.
 
-The low-level `groupctl` CLI includes `init`, `validate`, `events`, `status`, `event-create`, `remote-events`, `final-candidate`, and `finalize-confirmed`. The last two are finalization helpers, **not replacements for the human prompt command `FINAL`**.
+The low-level `groupctl` CLI includes `init`, `validate`, `events`, `status`, `event-create`, `remote-events`, `agent-context`, `agent-submit`, `task-create`, `tasks`, `sync`, `dashboard`, `audit`, `final-candidate`, and `finalize-confirmed`. The last two are finalization helpers, **not replacements for the human prompt command `FINAL`**.
 
 ## Global rules
 
@@ -16,6 +16,24 @@ The low-level `groupctl` CLI includes `init`, `validate`, `events`, `status`, `e
 8. `.group/local/` is for local-only state and must not be committed except `.group/local/.gitkeep`.
 9. Do not report a Git operation or test as successful unless its output/history confirms it.
 10. `SYNC` does not merge every feature branch; `PUB` does not merge into canonical state; a positive `REV` does not merge; successful Git merge does not prove semantic compatibility.
+
+## v1.0 external-agent bridge and coordination tools
+
+A provider-specific AI coding tool can use the JSON bridge without changing the collaboration event protocol. Before asking an external agent to work, export a validated context bundle:
+
+```powershell
+python groupctl.py agent-context --person-id <PERSON_ID> --output .group/local/agent_context.json
+```
+
+After `git fetch`, add `--remote origin` to include validated events from fetched remote-tracking branches. Pass the JSON context file and relevant source code to the coding agent. Ask it to return one JSON submission containing `event_type`, `payload`, and optional `related_events`; use `examples/agent_finding_submission.json` as a minimal example. Validate and record the response with:
+
+```powershell
+python groupctl.py agent-submit --person-id <PERSON_ID> --input-file .group/local/agent_submission.json
+python groupctl.py validate
+python groupctl.py status
+```
+
+The bridge refuses agent-originated finalization, self-review, unknown review/answer targets, unknown synthesis sources, and Git evidence that cannot be verified. It records a local event only. Inspect the event before deciding whether to commit and push it. The member ID is attribution, not authentication. The bridge does not call an LLM or automatically execute, commit, push, or merge generated code. See `specifications/08_ai_agent_bridge.md`.
 
 ## `SYNC` — synchronize working context with the group
 

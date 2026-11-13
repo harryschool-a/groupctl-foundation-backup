@@ -1,0 +1,10 @@
+{
+  "event_type": "finding",
+  "payload": {
+    "summary": "Describe one useful engineering observation.",
+    "evidence": [
+      "List reproducible evidence, tests, or inspected files."
+    ]
+  },
+  "related_events": []
+}

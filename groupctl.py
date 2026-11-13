@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Version 0.2 group collaboration helper.
+"""Version 1.0 group collaboration helper.
 
 Implemented milestones:
 - repository initialization;
@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+APP_VERSION = "1.0.0"
 PROTOCOL_VERSION = "0.1"
 GROUP_DIR = Path(".group")
 CONFIG_PATH = GROUP_DIR / "group.json"
@@ -46,6 +47,23 @@ SUPPORTED_EVENT_TYPES = {
     "synthesis_candidate",
     "final_candidate",
     "final_result",
+    "task_assigned",
+    "agent_session",
+}
+
+# AI agents may submit collaboration evidence and proposals, but may not use the
+# bridge to finalize a group or bypass the human-confirmation workflow.
+AGENT_SUBMITTABLE_EVENT_TYPES = {
+    "change_published",
+    "finding",
+    "question",
+    "answer",
+    "review",
+    "test_result",
+    "integration_result",
+    "blocker",
+    "synthesis_candidate",
+    "agent_session",
 }
 
 COMMON_EVENT_FIELDS = {
@@ -244,6 +262,18 @@ def validate_event_payload(data: dict[str, Any]) -> list[str]:
             errors.append("status must be one of: " + ", ".join(sorted(FINAL_STATUSES)) + ".")
         if _is_nonempty_string(data.get("report_file")) and (Path(data["report_file"]).is_absolute() or ".." in Path(data["report_file"]).parts):
             errors.append("report_file must be a repository-relative path without '..'.")
+
+    elif event_type == "task_assigned":
+        errors.extend(_validate_required_string_fields(data, ("task_id", "title", "assignee_id", "status")))
+        if data.get("status") not in {"open", "in_progress", "blocked", "completed", "cancelled"}:
+            errors.append("task_assigned status must be one of: open, in_progress, blocked, completed, cancelled.")
+        errors.extend(_validate_string_list_field(data, "depends_on", required=False))
+
+    elif event_type == "agent_session":
+        errors.extend(_validate_required_string_fields(data, ("session_id", "provider", "status", "summary")))
+        if data.get("status") not in {"started", "completed", "failed"}:
+            errors.append("agent_session status must be one of: started, completed, failed.")
+        errors.extend(_validate_string_list_field(data, "actions", required=False))
 
     return errors
 
@@ -588,6 +618,289 @@ def create_event(root: Path, event_type: str, payload: Any, person_id: str | Non
     write_json(event_path, event)
     return event_path
 
+
+
+def _agent_event_summary(event: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact, predictable event representation for an external agent."""
+    fields = (
+        "event_id", "event_type", "group_id", "person_id", "created_at",
+        "change_id", "summary", "branch", "commit", "verdict", "result",
+        "decision", "synthesis_id", "title", "source_change_ids", "scope",
+    )
+    return {key: event[key] for key in fields if key in event}
+
+
+def _load_agent_events(root: Path, remote: str | None = None) -> tuple[list[dict[str, Any]], list[str]]:
+    """Load validated local events and optionally validated fetched remote events."""
+    config = _load_valid_group(root)
+    events_by_id: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    events_dir = root / EVENTS_DIR
+    for path in sorted(events_dir.glob("*.json")):
+        try:
+            event = read_json(path)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        event_errors = validate_event(event, path)
+        if isinstance(event, dict) and event.get("group_id") != config["group_id"]:
+            event_errors.append(f"{path.name}: group_id does not match this repository.")
+        if event_errors:
+            errors.extend(f"{path.name}: {item}" for item in event_errors)
+            continue
+        events_by_id[event["event_id"]] = event
+
+    if remote:
+        remote_events, remote_errors = collect_remote_events(root, remote)
+        errors.extend(remote_errors)
+        for event_id, item in remote_events.items():
+            remote_event = item["data"]
+            if event_id in events_by_id and events_by_id[event_id] != remote_event:
+                errors.append(f"Event {event_id} differs between local and remote copies.")
+            else:
+                events_by_id[event_id] = remote_event
+
+    events = sorted(events_by_id.values(), key=_event_time_key)
+    return events, errors
+
+
+def _git_commit_exists(root: Path, commit: str) -> bool:
+    if not _is_nonempty_string(commit):
+        return False
+    try:
+        result = _run_git(root, "cat-file", "-e", f"{commit}^{{commit}}")
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _resolve_branch_ref(root: Path, branch: str) -> str | None:
+    """Resolve a local or fetched remote-tracking ref for a branch name."""
+    if not _is_nonempty_string(branch):
+        return None
+    check = _run_git(root, "check-ref-format", "--branch", branch)
+    if check.returncode != 0:
+        return None
+    result = _run_git(root, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
+    if result.returncode != 0:
+        return None
+    refs = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    preferred = f"refs/heads/{branch}"
+    if preferred in refs:
+        return preferred
+    suffix = f"/{branch}"
+    matches = [ref for ref in refs if ref.startswith("refs/remotes/") and ref.endswith(suffix)]
+    return sorted(matches)[0] if matches else None
+
+
+def build_agent_context(
+    root: Path,
+    person_id: str,
+    *,
+    remote: str | None = None,
+    limit: int = 30,
+    include_instructions: bool = True,
+) -> dict[str, Any]:
+    """Build a read-only, provider-neutral context package for a local AI agent."""
+    root = root.resolve()
+    if limit < 1 or limit > 500:
+        raise ValueError("limit must be between 1 and 500.")
+    config = _load_valid_group(root)
+    person_id = _resolve_person_id(root, person_id)
+    member = read_json(root / MEMBERS_DIR / f"{person_id}.json")
+    assignment_relative = Path(config["assignment_file"])
+    assignment_path = root / assignment_relative
+    assignment_text = assignment_path.read_text(encoding="utf-8")
+
+    member_errors = validate_member_descriptors(root)
+    if member_errors:
+        raise ValueError("Invalid member descriptors: " + "; ".join(member_errors))
+    final_errors = validate_final_records(root, config)
+    if final_errors:
+        raise ValueError("Invalid finalization records: " + "; ".join(final_errors))
+    events, event_errors = _load_agent_events(root, remote)
+    if event_errors:
+        raise ValueError("Cannot provide agent context from invalid collaboration events: " + "; ".join(event_errors))
+
+    git_info: dict[str, Any] = {
+        "available": False,
+        "branch": None,
+        "head": None,
+        "working_tree_clean": None,
+        "changed_paths": [],
+        "canonical_branch": config["canonical_branch"],
+        "canonical_head": None,
+        "is_canonical_branch": False,
+        "head_is_canonical_tip": False,
+    }
+    try:
+        top = _run_git(root, "rev-parse", "--show-toplevel")
+        if top.returncode == 0:
+            git_info["available"] = True
+            branch_result = _run_git(root, "branch", "--show-current")
+            head_result = _run_git(root, "rev-parse", "HEAD")
+            status_result = _run_git(root, "status", "--porcelain", "--untracked-files=all")
+            canonical_result = _run_git(root, "rev-parse", f"refs/heads/{config['canonical_branch']}")
+            git_info["branch"] = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+            git_info["head"] = head_result.stdout.strip() if head_result.returncode == 0 else None
+            git_info["changed_paths"] = [
+                line[3:].strip() for line in status_result.stdout.splitlines() if len(line) >= 4
+            ] if status_result.returncode == 0 else []
+            git_info["working_tree_clean"] = status_result.returncode == 0 and not status_result.stdout.strip()
+            git_info["canonical_head"] = canonical_result.stdout.strip() if canonical_result.returncode == 0 else None
+            git_info["is_canonical_branch"] = git_info["branch"] == config["canonical_branch"]
+            git_info["head_is_canonical_tip"] = bool(
+                git_info["is_canonical_branch"] and git_info["head"]
+                and git_info["head"] == git_info["canonical_head"]
+            )
+    except OSError:
+        # Context generation remains useful for a source archive without Git.
+        pass
+
+    instructions_text = None
+    instructions_path = root / "AGENT_INSTRUCTIONS.md"
+    if include_instructions and instructions_path.is_file():
+        instructions_text = instructions_path.read_text(encoding="utf-8")
+
+    compact_events = [_agent_event_summary(event) for event in events[-limit:]]
+    return {
+        "schema_version": 1,
+        "tool_version": APP_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "group": {
+            "group_id": config["group_id"],
+            "canonical_branch": config["canonical_branch"],
+            "assignment_file": config["assignment_file"],
+        },
+        "member": member,
+        "assignment": {"path": config["assignment_file"], "text": assignment_text},
+        "repository": git_info,
+        "collaboration": {
+            "event_count": len(events),
+            "events_included": len(compact_events),
+            "events": compact_events,
+            "available_submission_types": sorted(AGENT_SUBMITTABLE_EVENT_TYPES),
+        },
+        "agent_instructions": instructions_text,
+        "safety_rules": [
+            "Do not commit, push, merge, or delete branches unless the human explicitly authorizes the exact action.",
+            "A published change is not automatically reviewed or integrated.",
+            "Do not review your own change; independent review must come from another member.",
+            "Tie test evidence to the exact commit that was tested.",
+            "A synthesis candidate is a proposal, not an implementation or merge.",
+            "Finalization requires a human to inspect the candidate and explicitly confirm it.",
+        ],
+    }
+
+
+def submit_agent_event(
+    root: Path,
+    person_id: str,
+    submission: Any,
+    *,
+    remote: str | None = None,
+) -> Path:
+    """Validate an agent response and record it as one immutable collaboration event."""
+    root = root.resolve()
+    config = _load_valid_group(root)
+    person_id = _resolve_person_id(root, person_id)
+    if not isinstance(submission, dict):
+        raise ValueError("Agent submission must be a JSON object.")
+    unknown = sorted(set(submission) - {"event_type", "payload", "related_events"})
+    if unknown:
+        raise ValueError("Agent submission contains unsupported top-level fields: " + ", ".join(unknown))
+    event_type = submission.get("event_type")
+    if not isinstance(event_type, str) or event_type not in AGENT_SUBMITTABLE_EVENT_TYPES:
+        raise ValueError(
+            "Agent bridge does not permit this event type. Allowed types: "
+            + ", ".join(sorted(AGENT_SUBMITTABLE_EVENT_TYPES))
+        )
+    payload = submission.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("Agent submission 'payload' must be a JSON object.")
+    related_events = submission.get("related_events", [])
+    if not isinstance(related_events, list) or any(not _is_nonempty_string(item) for item in related_events):
+        raise ValueError("related_events must be an array of non-empty event IDs.")
+
+    events, event_errors = _load_agent_events(root, remote)
+    if event_errors:
+        raise ValueError("Cannot accept an agent submission while collaboration events are invalid: " + "; ".join(event_errors))
+    by_id = {event["event_id"]: event for event in events}
+
+    if event_type == "answer":
+        question_id = payload.get("question_id")
+        source = next((event for event in events if event.get("event_type") == "question" and event.get("question_id") == question_id), None)
+        if source is None:
+            raise ValueError(f"Cannot answer unknown question_id {question_id!r}.")
+        if source["event_id"] not in related_events:
+            related_events = [*related_events, source["event_id"]]
+
+    elif event_type == "blocker":
+        blocking_change_id = payload.get("blocking_change_id")
+        if blocking_change_id:
+            source = next((event for event in events if event.get("event_type") == "change_published" and event.get("change_id") == blocking_change_id), None)
+            if source is None:
+                raise ValueError(f"Blocker references unknown change_id {blocking_change_id!r}.")
+            if source["event_id"] not in related_events:
+                related_events = [*related_events, source["event_id"]]
+
+    elif event_type == "review":
+        change_id = payload.get("change_id")
+        source = next((event for event in events if event.get("event_type") == "change_published" and event.get("change_id") == change_id), None)
+        if source is None:
+            raise ValueError(f"Cannot review unknown change_id {change_id!r}.")
+        if source.get("person_id") == person_id:
+            raise ValueError("Self-review is not allowed by the agent bridge; use a different member for independent review.")
+        if source["event_id"] not in related_events:
+            related_events = [*related_events, source["event_id"]]
+
+    elif event_type == "change_published":
+        branch = payload.get("branch")
+        commit = payload.get("commit")
+        if not _git_commit_exists(root, commit):
+            raise ValueError("change_published commit must resolve to a Git commit available in this repository.")
+        if _resolve_branch_ref(root, branch) is None:
+            raise ValueError(f"change_published branch {branch!r} must exist as a local or fetched remote branch.")
+
+    elif event_type == "test_result":
+        if not _git_commit_exists(root, payload.get("commit")):
+            raise ValueError("test_result commit must resolve to a Git commit available in this repository.")
+
+    elif event_type == "integration_result":
+        change_id = payload.get("change_id")
+        source = next((event for event in events if event.get("event_type") == "change_published" and event.get("change_id") == change_id), None)
+        if source is None:
+            raise ValueError(f"Cannot record integration for unknown change_id {change_id!r}.")
+        if source["event_id"] not in related_events:
+            related_events = [*related_events, source["event_id"]]
+        if payload.get("result") == "success":
+            merge_commit = payload.get("merge_commit")
+            branch_ref = _resolve_branch_ref(root, payload.get("target_branch"))
+            if not _git_commit_exists(root, merge_commit):
+                raise ValueError("Successful integration requires a merge_commit available in this repository.")
+            if branch_ref is None:
+                raise ValueError("Successful integration target_branch must exist as a local or fetched remote branch.")
+            ancestry = _run_git(root, "merge-base", "--is-ancestor", merge_commit, branch_ref)
+            if ancestry.returncode != 0:
+                raise ValueError("Successful integration cannot be recorded: merge_commit is not an ancestor of target_branch.")
+
+    elif event_type == "synthesis_candidate":
+        source_ids = payload.get("source_change_ids")
+        if isinstance(source_ids, list):
+            for change_id in source_ids:
+                source = next((event for event in events if event.get("event_type") == "change_published" and event.get("change_id") == change_id), None)
+                if source is None:
+                    raise ValueError(f"Synthesis source change_id {change_id!r} is unknown in the supplied group context.")
+                if source["event_id"] not in related_events:
+                    related_events = [*related_events, source["event_id"]]
+
+    # Ensure every caller-supplied related event is part of the validated group context.
+    unknown_related = [event_id for event_id in related_events if event_id not in by_id]
+    if unknown_related:
+        raise ValueError("related_events contains unknown event IDs: " + ", ".join(unknown_related))
+
+    return create_event(root, event_type, payload, person_id, related_events)
 
 
 def _run_git(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -1151,6 +1464,51 @@ def command_event_create(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def command_agent_context(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    try:
+        context = build_agent_context(
+            root,
+            args.person_id,
+            remote=args.remote,
+            limit=args.limit,
+            include_instructions=not args.no_instructions,
+        )
+        rendered = json.dumps(context, indent=2, ensure_ascii=False) + "\n"
+        if args.output:
+            output_path = Path(args.output)
+            if not output_path.is_absolute():
+                output_path = root / output_path
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8", newline="\n")
+            print(f"Agent context written: {output_path.relative_to(root) if output_path.is_relative_to(root) else output_path}")
+        else:
+            sys.stdout.write(rendered)
+        return 0
+    except (ValueError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def command_agent_submit(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    input_path = Path(args.input_file)
+    if not input_path.is_absolute():
+        input_path = root / input_path
+    try:
+        submission = read_json(input_path)
+        event_path = submit_agent_event(root, args.person_id, submission, remote=args.remote)
+        event = read_json(event_path)
+    except (ValueError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"Created agent event: {event_path.relative_to(root)}")
+    print(f"Event ID: {event['event_id']}")
+    print(f"Event type: {event['event_type']}")
+    print("The event is local only until a human-approved Git commit and push publish it.")
+    return 0
+
 def _git_output(root: Path, *arguments: str) -> str:
     result = _run_git(root, *arguments)
     if result.returncode != 0:
@@ -1475,11 +1833,101 @@ def command_finalize_confirmed(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def _all_valid_events(root: Path, remote: str | None = None) -> list[dict[str, Any]]:
+    events, errors = _load_agent_events(root, remote)
+    if errors:
+        raise ValueError("Cannot continue while collaboration events are invalid: " + "; ".join(errors))
+    return events
+
+
+def command_task_create(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    try:
+        _load_valid_group(root)
+        person_id = _resolve_person_id(root, args.person_id)
+        assignee = _resolve_person_id(root, args.assignee_id)
+        payload = {"task_id": args.task_id or f"T-{uuid.uuid4().hex[:8]}", "title": args.title,
+                   "assignee_id": assignee, "status": args.status, "depends_on": args.depends_on}
+        path = create_event(root, "task_assigned", payload, person_id, args.related_event)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr); return 1
+    print(f"Task recorded: {payload['task_id']}")
+    print(f"Assignee: {assignee}")
+    print(f"Event: {path.relative_to(root)}")
+    return 0
+
+
+def command_tasks(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    try: events = _all_valid_events(root, args.remote)
+    except ValueError as exc: print(f"ERROR: {exc}", file=sys.stderr); return 1
+    latest: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if event.get("event_type") == "task_assigned": latest[event["task_id"]] = event
+    print(f"TASKS ({len(latest)})")
+    for task_id in sorted(latest):
+        e=latest[task_id]; print(f"  {task_id} [{e.get('status')}] -> {e.get('assignee_id')} — {e.get('title')}")
+        deps=e.get('depends_on') or []
+        if deps: print("    depends on: " + ", ".join(deps))
+    return 0
+
+
+def command_sync(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    try: result = _run_git(root, "fetch", args.remote, "--prune")
+    except OSError: print("ERROR: Git is required for sync.", file=sys.stderr); return 1
+    if result.returncode != 0:
+        print(result.stderr.strip() or "Git fetch failed.", file=sys.stderr); return result.returncode or 1
+    print(f"Fetched {args.remote}.")
+    ns=argparse.Namespace(root=str(root), remote=args.remote, new_only=True, mark_seen=args.mark_seen)
+    return command_remote_events(ns)
+
+
+def command_dashboard(args: argparse.Namespace) -> int:
+    root=Path(args.root).resolve()
+    try: config=_load_valid_group(root); events=_all_valid_events(root, args.remote)
+    except ValueError as exc: print(f"ERROR: {exc}", file=sys.stderr); return 1
+    counts={}
+    for e in events: counts[e['event_type']]=counts.get(e['event_type'],0)+1
+    tasks=[e for e in events if e.get('event_type')=='task_assigned']; changes=[e for e in events if e.get('event_type')=='change_published']; reviews=[e for e in events if e.get('event_type')=='review']
+    import html
+    esc=lambda x: html.escape(str(x))
+    rows=''.join(f"<tr><td>{esc(k)}</td><td>{v}</td></tr>" for k,v in sorted(counts.items()))
+    task_rows=''.join(f"<tr><td>{esc(e['task_id'])}</td><td>{esc(e['title'])}</td><td>{esc(e['assignee_id'])}</td><td>{esc(e['status'])}</td></tr>" for e in tasks[-50:]) or '<tr><td colspan="4">No tasks</td></tr>'
+    change_rows=''.join(f"<li><b>{esc(e.get('change_id'))}</b> — {esc(e.get('summary'))}</li>" for e in changes[-20:]) or '<li>No published changes</li>'
+    review_rows=''.join(f"<li><b>{esc(e.get('change_id'))}</b>: {esc(e.get('verdict'))} — {esc(e.get('summary'))}</li>" for e in reviews[-20:]) or '<li>No reviews</li>'
+    generated=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    page=f'''<!doctype html><html><head><meta charset="utf-8"><title>groupctl dashboard</title><style>body{{font-family:system-ui;margin:2rem;max-width:1000px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:.5rem;text-align:left}}</style></head><body><h1>groupctl v1.0 dashboard</h1><p><b>Group:</b> {esc(config['group_id'])} &nbsp; <b>Events:</b> {len(events)} &nbsp; <b>Generated:</b> {generated}</p><h2>Event activity</h2><table><tr><th>Type</th><th>Count</th></tr>{rows}</table><h2>Tasks</h2><table><tr><th>ID</th><th>Title</th><th>Assignee</th><th>Status</th></tr>{task_rows}</table><h2>Recent changes</h2><ul>{change_rows}</ul><h2>Recent reviews</h2><ul>{review_rows}</ul><p>Generated from validated collaboration records. This dashboard does not merge code or finalize releases.</p></body></html>'''
+    out=Path(args.output) if args.output else root/LOCAL_DIR/'dashboard.html'
+    if not out.is_absolute(): out=root/out
+    out.parent.mkdir(parents=True, exist_ok=True); out.write_text(page,encoding='utf-8')
+    print(f"Dashboard written: {out.relative_to(root)}"); return 0
+
+
+def command_audit(args: argparse.Namespace) -> int:
+    root=Path(args.root).resolve(); issues=[]
+    try: config=_load_valid_group(root); events=_all_valid_events(root,args.remote)
+    except ValueError as exc: print(f"ERROR: {exc}",file=sys.stderr); return 1
+    changes={e.get('change_id'):e for e in events if e.get('event_type')=='change_published'}; reviews={}
+    for e in events:
+        if e.get('event_type')=='review': reviews.setdefault(e.get('change_id'),[]).append(e)
+    for cid,e in changes.items():
+        independent=[r for r in reviews.get(cid,[]) if r.get('person_id')!=e.get('person_id')]
+        if not independent: issues.append(f"Change {cid} has no independent review.")
+    active=[e for e in events if e.get('event_type')=='blocker' and str(e.get('status','open')).lower() not in {'resolved','closed'}]
+    if active: issues.append(f"{len(active)} blocker event(s) are recorded.")
+    print("AUDIT"); print(f"Group: {config['group_id']}"); print(f"Events checked: {len(events)}")
+    if issues:
+        print("Result: ATTENTION REQUIRED"); [print("- "+i) for i in issues]; return 2
+    print("Result: OK — no protocol-level issues found."); return 0
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="groupctl",
-        description="Version 0.2 group collaboration repository helper.",
+        description="Version 1.0 group collaboration and provider-neutral AI-agent bridge.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="create the required .group/ scaffold")
@@ -1532,6 +1980,59 @@ def build_parser() -> argparse.ArgumentParser:
     remote_events_parser.add_argument("--mark-seen", action="store_true",
                                       help="update the local-only checkpoint after the caller has inspected events")
     remote_events_parser.set_defaults(func=command_remote_events)
+
+    agent_context_parser = subparsers.add_parser(
+        "agent-context", help="export validated group context for an external AI coding agent"
+    )
+    agent_context_parser.add_argument("--root", default=".", help="repository root (default: current directory)")
+    agent_context_parser.add_argument("--person-id", required=True, help="member identity for this agent session")
+    agent_context_parser.add_argument("--remote", help="include validated events from an already-fetched remote, e.g. origin")
+    agent_context_parser.add_argument("--limit", type=int, default=30, help="maximum recent events to include (1-500)")
+    agent_context_parser.add_argument("--output", help="write JSON to this path instead of stdout")
+    agent_context_parser.add_argument("--no-instructions", action="store_true", help="omit AGENT_INSTRUCTIONS.md from the context bundle")
+    agent_context_parser.set_defaults(func=command_agent_context)
+
+    agent_submit_parser = subparsers.add_parser(
+        "agent-submit", help="validate and record a structured response from an external AI agent"
+    )
+    agent_submit_parser.add_argument("--root", default=".", help="repository root (default: current directory)")
+    agent_submit_parser.add_argument("--person-id", required=True, help="member identity submitting the response")
+    agent_submit_parser.add_argument("--input-file", required=True, help="JSON file with event_type, payload, and optional related_events")
+    agent_submit_parser.add_argument("--remote", help="include validated events from an already-fetched remote, e.g. origin")
+    agent_submit_parser.set_defaults(func=command_agent_submit)
+
+    task_create_parser = subparsers.add_parser("task-create", help="assign or update a structured task")
+    task_create_parser.add_argument("--root", default=".")
+    task_create_parser.add_argument("--task-id")
+    task_create_parser.add_argument("--title", required=True)
+    task_create_parser.add_argument("--assignee-id", required=True)
+    task_create_parser.add_argument("--status", default="open", choices=["open","in_progress","blocked","completed","cancelled"])
+    task_create_parser.add_argument("--person-id")
+    task_create_parser.add_argument("--depends-on", action="append", default=[])
+    task_create_parser.add_argument("--related-event", action="append", default=[])
+    task_create_parser.set_defaults(func=command_task_create)
+
+    tasks_parser = subparsers.add_parser("tasks", help="show latest state of recorded tasks")
+    tasks_parser.add_argument("--root", default=".")
+    tasks_parser.add_argument("--remote")
+    tasks_parser.set_defaults(func=command_tasks)
+
+    sync_parser = subparsers.add_parser("sync", help="fetch a remote then inspect new collaboration events")
+    sync_parser.add_argument("--root", default=".")
+    sync_parser.add_argument("--remote", default="origin")
+    sync_parser.add_argument("--mark-seen", action="store_true")
+    sync_parser.set_defaults(func=command_sync)
+
+    dashboard_parser = subparsers.add_parser("dashboard", help="generate a local HTML collaboration dashboard")
+    dashboard_parser.add_argument("--root", default=".")
+    dashboard_parser.add_argument("--remote")
+    dashboard_parser.add_argument("--output")
+    dashboard_parser.set_defaults(func=command_dashboard)
+
+    audit_parser = subparsers.add_parser("audit", help="check for basic unresolved collaboration protocol issues")
+    audit_parser.add_argument("--root", default=".")
+    audit_parser.add_argument("--remote")
+    audit_parser.set_defaults(func=command_audit)
 
     candidate_parser = subparsers.add_parser(
         "final-candidate",
